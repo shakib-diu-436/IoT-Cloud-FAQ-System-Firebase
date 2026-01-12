@@ -1,0 +1,157 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FirebaseESP8266.h>
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ================= BUTTONS =================
+#define UP_BTN D5
+#define DOWN_BTN D6
+#define SELECT_BTN D7
+
+// ================= WIFI =================
+const char* ssid = "Pixel3";
+const char* password = "12345678";
+
+// ================= FIREBASE =================
+#define FIREBASE_HOST "your-project-id.firebaseio.com"
+#define FIREBASE_AUTH "YOUR_DATABASE_SECRET"
+
+FirebaseData fbdo;
+FirebaseConfig config;
+FirebaseAuth auth;
+
+// ================= SERVER =================
+ESP8266WebServer server(80);
+
+// ================= VARIABLES =================
+int currentQuestion = 0;
+bool showAnswer = false;
+String questionText, answerText;
+
+// ================= FIREBASE FUNCTIONS =================
+void loadFAQ(int index) {
+  Firebase.getString(fbdo, "/faq/" + String(index) + "/question");
+  questionText = fbdo.stringData();
+
+  Firebase.getString(fbdo, "/faq/" + String(index) + "/answer");
+  answerText = fbdo.stringData();
+}
+
+void increaseView(int index) {
+  Firebase.getInt(fbdo, "/faq/" + String(index) + "/views");
+  int views = fbdo.intData();
+  Firebase.setInt(fbdo, "/faq/" + String(index) + "/views", views + 1);
+}
+
+// ================= LCD FUNCTIONS =================
+void showQuestionLCD() {
+  loadFAQ(currentQuestion);
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Question:");
+  lcd.setCursor(0, 1);
+  lcd.print(questionText.substring(0, 20));
+}
+
+void showAnswerLCD() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Answer:");
+  lcd.setCursor(0, 1);
+  lcd.print(answerText.substring(0, 20));
+  increaseView(currentQuestion);
+}
+
+// ================= WEB =================
+void handleRoot() {
+  String html = "<h1>DIU FAQ System</h1><ul>";
+
+  for (int i = 0; i < 10; i++) {
+    Firebase.getString(fbdo, "/faq/" + String(i) + "/question");
+    String q = fbdo.stringData();
+
+    Firebase.getInt(fbdo, "/faq/" + String(i) + "/views");
+    int v = fbdo.intData();
+
+    html += "<li>" + q + " | Views: " + String(v) + "</li>";
+  }
+
+  html += "</ul>";
+  server.send(200, "text/html", html);
+}
+
+// ================= BUTTON HANDLER =================
+void handleButtons() {
+  if (digitalRead(UP_BTN) == LOW) {
+    currentQuestion--;
+    if (currentQuestion < 0) currentQuestion = 9;
+    showAnswer = false;
+    showQuestionLCD();
+    delay(250);
+  }
+
+  if (digitalRead(DOWN_BTN) == LOW) {
+    currentQuestion++;
+    if (currentQuestion > 9) currentQuestion = 0;
+    showAnswer = false;
+    showQuestionLCD();
+    delay(250);
+  }
+
+  if (digitalRead(SELECT_BTN) == LOW) {
+    if (!showAnswer) {
+      showAnswer = true;
+      showAnswerLCD();
+    } else {
+      showAnswer = false;
+      showQuestionLCD();
+    }
+    delay(300);
+  }
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(D2, D1);
+  lcd.init();
+  lcd.backlight();
+
+  pinMode(UP_BTN, INPUT_PULLUP);
+  pinMode(DOWN_BTN, INPUT_PULLUP);
+  pinMode(SELECT_BTN, INPUT_PULLUP);
+
+  WiFi.begin(ssid, password);
+  lcd.print("Connecting WiFi");
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    lcd.print(".");
+  }
+
+  lcd.clear();
+  lcd.print("WiFi Connected");
+
+  // Firebase init
+  config.database_url = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  // Web server
+  server.on("/", handleRoot);
+  server.begin();
+
+  delay(1500);
+  showQuestionLCD();
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+  handleButtons();
+}
