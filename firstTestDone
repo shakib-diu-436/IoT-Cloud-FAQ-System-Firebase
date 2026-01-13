@@ -1,0 +1,712 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <FirebaseESP8266.h>
+
+// ===== Firebase Configuration =====
+#define FIREBASE_HOST "iot-cloud-faq-system-firebase-default-rtdb.asia-southeast1.firebasedatabase.app"
+#define FIREBASE_AUTH "7wvo8qOGIAzqf2g4yWkqCKXjsXkWfLgwKSVhSGMY"
+
+// ===== WiFi Configuration =====
+const char* ssid = "Pixel3";
+const char* password = "12345678";
+
+// ===== Firebase Objects =====
+FirebaseData firebaseData;
+FirebaseAuth auth;
+FirebaseConfig config;
+
+// ===== LCD =====
+LiquidCrystal_I2C lcd(0x27, 20, 4);
+
+// ===== Buttons =====
+#define UP_BTN D5
+#define DOWN_BTN D6
+#define SELECT_BTN D7
+#define SYNC_BTN D8
+
+// ===== FAQ Data Structures =====
+typedef struct {
+  int id;
+  String question;
+  String answer;
+  int views;
+  int originalIndex;
+} FAQItem;
+
+FAQItem faqItems[50];
+int faqCount = 0;
+int currentDisplayIndex = 0;
+bool showAnswer = false;
+bool isSortedByViews = true;
+
+// ===== Web Server =====
+ESP8266WebServer server(80);
+
+// ===== Firebase Base Path =====
+const String FIREBASE_BASE_PATH = "/root/faq/";
+
+// ===== Timing Variables =====
+unsigned long lastSyncTime = 0;
+unsigned long lastButtonCheck = 0;
+const unsigned long SYNC_INTERVAL = 300000;
+const unsigned long BUTTON_CHECK_INTERVAL = 100;
+
+// ===== Helper Function =====
+int getMin(int a, int b) {
+  return (a < b) ? a : b;
+}
+
+// ===== Sorting Functions =====
+void sortByViewsDesc() {
+  for (int i = 0; i < faqCount - 1; i++) {
+    for (int j = 0; j < faqCount - i - 1; j++) {
+      if (faqItems[j].views < faqItems[j + 1].views) {
+        FAQItem temp = faqItems[j];
+        faqItems[j] = faqItems[j + 1];
+        faqItems[j + 1] = temp;
+      }
+    }
+  }
+  isSortedByViews = true;
+}
+
+void sortByIdAsc() {
+  for (int i = 0; i < faqCount - 1; i++) {
+    for (int j = 0; j < faqCount - i - 1; j++) {
+      if (faqItems[j].originalIndex > faqItems[j + 1].originalIndex) {
+        FAQItem temp = faqItems[j];
+        faqItems[j] = faqItems[j + 1];
+        faqItems[j + 1] = temp;
+      }
+    }
+  }
+  isSortedByViews = false;
+}
+
+// ===== Firebase Functions =====
+void initializeFirebase() {
+  Serial.println("Initializing Firebase...");
+  
+  config.host = FIREBASE_HOST;
+  config.signer.tokens.legacy_token = FIREBASE_AUTH;
+  config.timeout.serverResponse = 10 * 1000;
+  
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+  
+  firebaseData.setBSSLBufferSize(2048, 2048);
+  firebaseData.setResponseSize(2048);
+  
+  if (Firebase.ready()) {
+    Serial.println("✓ Firebase connected!");
+  } else {
+    Serial.println("✗ Firebase connection failed");
+  }
+}
+
+void syncFromFirebase() {
+  Serial.println("=== Syncing from Firebase ===");
+  
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Syncing...");
+  
+  int oldCount = faqCount;
+  faqCount = 0;
+  
+  // Sequential access
+  for (int i = 0; i < 50; i++) {
+    String questionPath = FIREBASE_BASE_PATH + String(i) + "/question";
+    
+    if (Firebase.getString(firebaseData, questionPath)) {
+      faqItems[faqCount].question = firebaseData.stringData();
+      Serial.println("Found FAQ " + String(i) + ": " + faqItems[faqCount].question);
+      
+      // Get answer
+      String answerPath = FIREBASE_BASE_PATH + String(i) + "/answer";
+      if (Firebase.getString(firebaseData, answerPath)) {
+        faqItems[faqCount].answer = firebaseData.stringData();
+      } else {
+        faqItems[faqCount].answer = "Answer not available";
+      }
+      
+      // Get views
+      String viewsPath = FIREBASE_BASE_PATH + String(i) + "/views";
+      if (Firebase.getInt(firebaseData, viewsPath)) {
+        faqItems[faqCount].views = firebaseData.intData();
+      } else {
+        faqItems[faqCount].views = 0;
+      }
+      
+      faqItems[faqCount].id = faqCount;
+      faqItems[faqCount].originalIndex = i;
+      faqCount++;
+      
+      // Show progress on LCD
+      lcd.setCursor(0, 1);
+      lcd.print("Found: " + String(faqCount));
+      
+    } else {
+      break;
+    }
+  }
+  
+  if (faqCount > 0) {
+    sortByViewsDesc();
+    
+    Serial.println("\n✓ Loaded " + String(faqCount) + " FAQs");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Synced: " + String(faqCount));
+    lcd.setCursor(0, 1);
+    lcd.print("FAQs loaded");
+    delay(1500);
+    
+    currentDisplayIndex = 0;
+    showQuestion();
+    
+  } else if (oldCount > 0) {
+    faqCount = oldCount;
+    Serial.println("✗ Sync failed, keeping old data");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Sync failed!");
+    lcd.setCursor(0, 1);
+    lcd.print("Keeping old data");
+    delay(1500);
+    
+    showQuestion();
+  } else {
+    Serial.println("✗ No FAQs found!");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("No FAQs found");
+    delay(2000);
+  }
+  
+  lastSyncTime = millis();
+}
+
+void updateViewsOnFirebase(int displayIndex) {
+  if (displayIndex >= faqCount) return;
+  
+  int originalIndex = faqItems[displayIndex].originalIndex;
+  String path = FIREBASE_BASE_PATH + String(originalIndex) + "/views";
+  
+  Serial.println("Updating views for FAQ #" + String(originalIndex) + 
+                " to " + String(faqItems[displayIndex].views));
+  
+  if (Firebase.setInt(firebaseData, path, faqItems[displayIndex].views)) {
+    Serial.println("✓ Views updated");
+  } else {
+    Serial.println("✗ Update failed: " + firebaseData.errorReason());
+  }
+}
+
+// ===== Increment views from web interface =====
+void incrementViewsFromWeb(int displayIndex) {
+  if (displayIndex >= faqCount) return;
+  
+  faqItems[displayIndex].views++;
+  updateViewsOnFirebase(displayIndex);
+  
+  // Re-sort if in TOP view
+  if (isSortedByViews) {
+    sortByViewsDesc();
+  }
+}
+
+// ===== Display Functions =====
+void showQuestion() {
+  if (faqCount == 0) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("No FAQs loaded");
+    lcd.setCursor(0, 1);
+    lcd.print("Press SYNC button");
+    return;
+  }
+  
+  lcd.clear();
+  
+  // Line 1
+  lcd.setCursor(0, 0);
+  lcd.print("Q");
+  lcd.print(currentDisplayIndex + 1);
+  lcd.print("/");
+  lcd.print(faqCount);
+  
+  lcd.setCursor(8, 0);
+  lcd.print("ID:");
+  lcd.print(faqItems[currentDisplayIndex].originalIndex);
+  
+  lcd.setCursor(15, 0);
+  if (isSortedByViews) {
+    lcd.print("TOP");
+  } else {
+    lcd.print("ALL");
+  }
+  
+  // Line 2-3: Question
+  String question = faqItems[currentDisplayIndex].question;
+  question.replace("\n", " ");
+  question.trim();
+  
+  if (question.length() <= 20) {
+    lcd.setCursor(0, 1);
+    lcd.print(question);
+  } else if (question.length() <= 40) {
+    lcd.setCursor(0, 1);
+    lcd.print(question.substring(0, 20));
+    lcd.setCursor(0, 2);
+    lcd.print(question.substring(20));
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print(question.substring(0, 20));
+    lcd.setCursor(0, 2);
+    lcd.print(question.substring(20, 40));
+    lcd.setCursor(0, 3);
+    lcd.print(question.substring(40, getMin(60, question.length())));
+  }
+  
+  // Line 4: Views
+  if (question.length() <= 40) {
+    lcd.setCursor(0, 3);
+    lcd.print("Views: ");
+    lcd.print(faqItems[currentDisplayIndex].views);
+  }
+}
+
+void showAnswerText() {
+  lcd.clear();
+  
+  lcd.setCursor(0, 0);
+  lcd.print("Answer #");
+  lcd.print(faqItems[currentDisplayIndex].originalIndex);
+  
+  lcd.setCursor(13, 0);
+  lcd.print("V:");
+  lcd.print(faqItems[currentDisplayIndex].views);
+  
+  String answer = faqItems[currentDisplayIndex].answer;
+  answer.replace("\n", " ");
+  answer.trim();
+  
+  if (answer.length() <= 20) {
+    lcd.setCursor(0, 1);
+    lcd.print(answer);
+  } else if (answer.length() <= 40) {
+    lcd.setCursor(0, 1);
+    lcd.print(answer.substring(0, 20));
+    lcd.setCursor(0, 2);
+    lcd.print(answer.substring(20));
+  } else if (answer.length() <= 60) {
+    lcd.setCursor(0, 1);
+    lcd.print(answer.substring(0, 20));
+    lcd.setCursor(0, 2);
+    lcd.print(answer.substring(20, 40));
+    lcd.setCursor(0, 3);
+    lcd.print(answer.substring(40));
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print(answer.substring(0, 20));
+    lcd.setCursor(0, 2);
+    lcd.print(answer.substring(20, 40));
+    lcd.setCursor(0, 3);
+    lcd.print(answer.substring(40, getMin(57, answer.length())) + "...");
+  }
+}
+
+// ===== Button Handler =====
+void handleButtons() {
+  unsigned long currentTime = millis();
+  
+  if (currentTime - lastButtonCheck < BUTTON_CHECK_INTERVAL) {
+    return;
+  }
+  lastButtonCheck = currentTime;
+  
+  static bool upPressed = false;
+  static bool downPressed = false;
+  static bool selectPressed = false;
+  static bool syncPressed = false;
+  
+  // UP Button
+  if (digitalRead(UP_BTN) == LOW) {
+    if (!upPressed && faqCount > 0) {
+      upPressed = true;
+      currentDisplayIndex--;
+      if (currentDisplayIndex < 0) {
+        currentDisplayIndex = faqCount - 1;
+      }
+      showAnswer = false;
+      showQuestion();
+      delay(200);
+    }
+  } else {
+    upPressed = false;
+  }
+  
+  // DOWN Button
+  if (digitalRead(DOWN_BTN) == LOW) {
+    if (!downPressed && faqCount > 0) {
+      downPressed = true;
+      currentDisplayIndex++;
+      if (currentDisplayIndex >= faqCount) {
+        currentDisplayIndex = 0;
+      }
+      showAnswer = false;
+      showQuestion();
+      delay(200);
+    }
+  } else {
+    downPressed = false;
+  }
+  
+  // SELECT Button
+  if (digitalRead(SELECT_BTN) == LOW) {
+    if (!selectPressed && faqCount > 0) {
+      selectPressed = true;
+      
+      if (showAnswer) {
+        showAnswer = false;
+        showQuestion();
+      } else {
+        showAnswer = true;
+        incrementViewsFromWeb(currentDisplayIndex);
+        showAnswerText();
+      }
+      delay(300);
+    }
+  } else {
+    selectPressed = false;
+  }
+  
+  // SYNC Button
+  if (digitalRead(SYNC_BTN) == LOW) {
+    if (!syncPressed) {
+      syncPressed = true;
+      unsigned long pressStart = millis();
+      
+      while (digitalRead(SYNC_BTN) == LOW) {
+        if (millis() - pressStart > 2000) {
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("Force Syncing...");
+          syncFromFirebase();
+          delay(100);
+          return;
+        }
+        delay(50);
+      }
+      
+      if (faqCount > 0) {
+        if (isSortedByViews) {
+          sortByIdAsc();
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("View: All FAQs");
+          delay(1000);
+        } else {
+          sortByViewsDesc();
+          lcd.clear();
+          lcd.setCursor(0, 0);
+          lcd.print("View: Top FAQs");
+          delay(1000);
+        }
+        currentDisplayIndex = 0;
+        showQuestion();
+      }
+    }
+  } else {
+    syncPressed = false;
+  }
+}
+
+// ===== Web Server Routes =====
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head>";
+  html += "<meta charset='UTF-8'>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1.0'>";
+  html += "<title>DIU FAQ System</title>";
+  html += "<style>";
+  html += "body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; }";
+  html += ".container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 15px; box-shadow: 0 10px 30px rgba(0,0,0,0.2); }";
+  html += "h1 { color: #333; text-align: center; border-bottom: 3px solid #667eea; padding-bottom: 15px; }";
+  html += ".status-box { background: #e8f0fe; padding: 15px; border-radius: 10px; margin: 20px 0; text-align: center; }";
+  html += ".btn { display: inline-block; background: linear-gradient(135deg, #667eea, #764ba2); color: white; padding: 10px 20px; border: none; border-radius: 25px; text-decoration: none; font-weight: bold; margin: 5px; cursor: pointer; }";
+  html += ".btn:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(0,0,0,0.2); }";
+  html += ".faq-list { margin-top: 30px; }";
+  html += ".faq-item { border: 2px solid #e0e0e0; border-radius: 10px; padding: 20px; margin: 15px 0; transition: all 0.3s; }";
+  html += ".faq-item:hover { border-color: #667eea; box-shadow: 0 5px 15px rgba(0,0,0,0.1); }";
+  html += ".faq-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }";
+  html += ".question { font-size: 1.2em; color: #222; font-weight: bold; flex-grow: 1; }";
+  html += ".meta { color: #666; font-size: 0.9em; }";
+  html += ".views { background: #34a853; color: white; padding: 3px 10px; border-radius: 20px; }";
+  html += ".answer-btn { background: #4285f4; color: white; padding: 8px 15px; border: none; border-radius: 5px; cursor: pointer; margin-top: 10px; }";
+  html += ".answer-btn:hover { background: #3367d6; }";
+  html += ".answer { color: #555; margin-top: 15px; padding: 15px; background: #f9f9f9; border-radius: 8px; border-left: 4px solid #34a853; display: none; }";
+  html += ".highlight { background: #fff3cd; border-color: #ffeaa7; }";
+  html += ".top-badge { background: #ff6b6b; color: white; padding: 2px 8px; border-radius: 3px; font-size: 0.8em; margin-left: 10px; }";
+  html += "</style>";
+  html += "<script>";
+  html += "function toggleAnswer(id) {";
+  html += "  var answer = document.getElementById('answer-' + id);";
+  html += "  var btn = document.getElementById('btn-' + id);";
+  html += "  if (answer.style.display === 'block') {";
+  html += "    answer.style.display = 'none';";
+  html += "    btn.innerHTML = 'Show Answer';";
+  html += "  } else {";
+  html += "    answer.style.display = 'block';";
+  html += "    btn.innerHTML = 'Hide Answer';";
+  html += "    // Increment view count via AJAX";
+  html += "    fetch('/view/' + id)";
+  html += "      .then(response => response.text())";
+  html += "      .then(data => {";
+  html += "        document.getElementById('views-' + id).innerHTML = '👁 ' + data + ' views';";
+  html += "      });";
+  html += "  }";
+  html += "}";
+  html += "function toggleSort() { window.location.href = '/toggle'; }";
+  html += "function syncData() { window.location.href = '/sync'; }";
+  html += "</script>";
+  html += "</head><body>";
+  html += "<div class='container'>";
+  html += "<h1>📚 DIU FAQ Cloud System</h1>";
+  
+  html += "<div class='status-box'>";
+  html += "<h3>Current View: ";
+  html += isSortedByViews ? "🔥 TOP FAQs (Most Popular First)" : "📋 ALL FAQs (Original Order)";
+  html += "</h3>";
+  html += "<p>Total FAQs: <strong>" + String(faqCount) + "</strong> | ";
+  html += "System IP: <strong>" + WiFi.localIP().toString() + "</strong></p>";
+  html += "<a class='btn' onclick='toggleSort()'>Switch View</a>";
+  html += "<a class='btn' onclick='syncData()' style='background:#34a853;'>🔄 Sync Now</a>";
+  html += "</div>";
+  
+  html += "<div class='faq-list'>";
+  html += "<h2>Frequently Asked Questions:</h2>";
+  
+  for (int i = 0; i < faqCount; i++) {
+    bool isTopThree = (isSortedByViews && i < 3);
+    
+    html += "<div class='faq-item";
+    if (isTopThree) html += " highlight";
+    html += "' id='faq-" + String(i) + "'>";
+    
+    html += "<div class='faq-header'>";
+    html += "<div class='question'>";
+    html += String(i+1) + ". " + faqItems[i].question;
+    if (isTopThree) html += "<span class='top-badge'>TOP " + String(i+1) + "</span>";
+    html += "</div>";
+    html += "<div class='meta'>";
+    html += "<span class='views' id='views-" + String(i) + "'>👁 " + String(faqItems[i].views) + " views</span>";
+    html += " | FB ID: " + String(faqItems[i].originalIndex);
+    html += "</div>";
+    html += "</div>";
+    
+    html += "<button class='answer-btn' id='btn-" + String(i) + "' onclick='toggleAnswer(" + String(i) + ")'>Show Answer</button>";
+    
+    html += "<div class='answer' id='answer-" + String(i) + "'>";
+    html += faqItems[i].answer;
+    html += "</div>";
+    
+    html += "</div>";
+  }
+  
+  html += "</div>";
+  html += "<div style='text-align:center; margin-top:30px; color:#666;'>";
+  html += "<p>DIU FAQ System | Daffodil International University</p>";
+  html += "</div>";
+  html += "</div>";
+  html += "</body></html>";
+  
+  server.send(200, "text/html", html);
+}
+
+// Handle view increment from web
+void handleView() {
+  String path = server.uri();
+  if (path.startsWith("/view/")) {
+    int qIndex = path.substring(6).toInt();
+    
+    if (qIndex >= 0 && qIndex < faqCount) {
+      // Increment view count
+      faqItems[qIndex].views++;
+      
+      // Update Firebase
+      int originalIndex = faqItems[qIndex].originalIndex;
+      String firebasePath = FIREBASE_BASE_PATH + String(originalIndex) + "/views";
+      Firebase.setInt(firebaseData, firebasePath, faqItems[qIndex].views);
+      
+      // Re-sort if needed
+      if (isSortedByViews) {
+        sortByViewsDesc();
+      }
+      
+      // Return updated view count
+      server.send(200, "text/plain", String(faqItems[qIndex].views));
+      return;
+    }
+  }
+  server.send(404, "text/plain", "Not found");
+}
+
+// Handle individual FAQ page
+void handleFAQPage() {
+  String path = server.uri();
+  if (path.startsWith("/faq/")) {
+    int qIndex = path.substring(5).toInt();
+    
+    if (qIndex >= 0 && qIndex < faqCount) {
+      // Increment view count when someone visits the page
+      faqItems[qIndex].views++;
+      int originalIndex = faqItems[qIndex].originalIndex;
+      String firebasePath = FIREBASE_BASE_PATH + String(originalIndex) + "/views";
+      Firebase.setInt(firebaseData, firebasePath, faqItems[qIndex].views);
+      
+      if (isSortedByViews) {
+        sortByViewsDesc();
+      }
+      
+      // Create individual FAQ page
+      String html = "<!DOCTYPE html><html><head>";
+      html += "<meta charset='UTF-8'>";
+      html += "<title>" + faqItems[qIndex].question + " - DIU FAQ</title>";
+      html += "<style>";
+      html += "body { font-family: Arial; margin: 20px; }";
+      html += ".container { max-width: 800px; margin: auto; }";
+      html += ".faq-detail { border: 2px solid #667eea; padding: 30px; border-radius: 15px; margin-top: 20px; }";
+      html += ".back-btn { background: #667eea; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px; }";
+      html += "</style>";
+      html += "</head><body>";
+      html += "<div class='container'>";
+      html += "<h1>DIU FAQ System</h1>";
+      html += "<a href='/' class='back-btn'>← Back to All FAQs</a>";
+      html += "<div class='faq-detail'>";
+      html += "<h2>" + faqItems[qIndex].question + "</h2>";
+      html += "<p style='color:#666;'>Views: " + String(faqItems[qIndex].views) + " | FAQ ID: " + String(qIndex+1) + "</p>";
+      html += "<div style='background:#f9f9f9; padding:20px; margin:20px 0; border-radius:10px;'>";
+      html += "<h3>Answer:</h3>";
+      html += "<p>" + faqItems[qIndex].answer + "</p>";
+      html += "</div>";
+      html += "</div>";
+      html += "</div>";
+      html += "</body></html>";
+      
+      server.send(200, "text/html", html);
+      return;
+    }
+  }
+  server.send(404, "text/plain", "FAQ not found");
+}
+
+void handleToggle() {
+  if (isSortedByViews) {
+    sortByIdAsc();
+  } else {
+    sortByViewsDesc();
+  }
+  currentDisplayIndex = 0;
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+// ===== Setup =====
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  
+  Serial.println("\n=== DIU FAQ System Starting ===");
+  
+  // Initialize LCD
+  Wire.begin(D2, D1);
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("DIU FAQ System");
+  delay(1000);
+  
+  // Initialize buttons
+  pinMode(UP_BTN, INPUT_PULLUP);
+  pinMode(DOWN_BTN, INPUT_PULLUP);
+  pinMode(SELECT_BTN, INPUT_PULLUP);
+  pinMode(SYNC_BTN, INPUT_PULLUP);
+  
+  // Connect to WiFi
+  Serial.println("Connecting to WiFi...");
+  lcd.clear();
+  lcd.print("Connecting WiFi");
+  
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✓ WiFi Connected!");
+    Serial.println("IP: " + WiFi.localIP().toString());
+    
+    lcd.clear();
+    lcd.print("WiFi Connected");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP().toString());
+    delay(1500);
+    
+    initializeFirebase();
+    
+    lcd.clear();
+    lcd.print("Syncing...");
+    syncFromFirebase();
+    
+  } else {
+    Serial.println("\n✗ WiFi Failed!");
+    lcd.clear();
+    lcd.print("WiFi Failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Offline Mode");
+    delay(2000);
+  }
+  
+  // Setup web server routes
+  server.on("/", handleRoot);
+  server.on("/toggle", handleToggle);
+  server.on("/sync", []() {
+    syncFromFirebase();
+    server.sendHeader("Location", "/");
+    server.send(303);
+  });
+  server.on("/view/", handleView);
+  server.on("/faq/", handleFAQPage);
+  
+  server.begin();
+  Serial.println("✓ HTTP Server started");
+  
+  Serial.println("\n=== System Ready ===");
+}
+
+// ===== Main Loop =====
+void loop() {
+  server.handleClient();
+  handleButtons();
+  
+  unsigned long currentTime = millis();
+  if (WiFi.status() == WL_CONNECTED && 
+      currentTime - lastSyncTime > SYNC_INTERVAL && 
+      faqCount > 0) {
+    Serial.println("Auto-syncing...");
+    syncFromFirebase();
+  }
+  
+  delay(10);
+}
